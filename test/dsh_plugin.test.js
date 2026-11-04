@@ -93,10 +93,14 @@ function fakeClient() {
 
 test("manifest 为两个运行模式声明稳定权限控制", async () => {
   const manifest = await fs.readFile(path.join(__dirname, "..", "pluginbridge-plugin.yaml"), "utf8");
-  for (const mode of ["desktop", "native"]) {
-    const block = manifest.match(new RegExp(`  ${mode}:\\n((?:    [^\\n]+\\n)*)`));
-    assert.ok(block, `缺少 ${mode} 运行模式控制声明`);
-    assert.match(block[1], /^    permission: stable$/m, `${mode} 模式必须发布稳定权限选项`);
+  const lf = manifest.replace(/\r\n/g, "\n");
+  for (const text of [lf, lf.replace(/\n/g, "\r\n")]) {
+    const normalized = text.replace(/\r\n/g, "\n");
+    for (const mode of ["desktop", "native"]) {
+      const block = normalized.match(new RegExp(`  ${mode}:\\n((?:    [^\\n]+\\n)*)`));
+      assert.ok(block, `缺少 ${mode} 运行模式控制声明`);
+      assert.match(block[1], /^    permission: stable$/m, `${mode} 模式必须发布稳定权限选项`);
+    }
   }
 });
 
