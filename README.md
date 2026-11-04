@@ -1,33 +1,73 @@
-# DeepSeek Harness Prism 插件
+# dsh
 
-这是一个 Prism PluginBridge v4 插件，连接本机运行的 DeepSeek Harness。
+DeepSeek Harness desktop-automation plugin for Prism PluginBridge.
 
-## 运行模式
+This release uses the public `@rokid-prism/pluginbridge-plugin-sdk` package and
+the Hub-managed Node 22 runtime. The recommended mode is `desktop`: it controls
+the already logged-in DeepSeek Harness window through CDP and does not require
+copying Harness cookies or tokens into the plugin.
 
-- `native`：通过 Harness 的本地 HTTP RPC 和 WebSocket 事件流访问会话。支持会话列表、历史、发送消息、等待运行、停止运行、模型/推理强度切换、重命名和归档。
-- `desktop`：优先在 Harness 已登录页面中通过 CDP 执行页面内 RPC，自动复用浏览器 Cookie；会话切换、可见性、桌面事件订阅也通过页面 DOM 和页面内 RPC 确认。若没有 CDP 端点，不会降级为未授权的独立 HTTP 请求。
+## Current behavior
 
-新版 Harness 桌面切换旧会话时，插件会根据会话 `cwd` 幂等登记工作区，并通过 Harness 的 `session.create({sessionId, workspaceId})` 将未归属的旧会话挂回工作区后再点击桌面行。旧版 Typert API 没有 workspace 注册接口，插件会跳过这一步，直接按会话标题和桌面树行切换。Harness 标记为 `blank` 的会话是“新会话”占位行，不会宣称桌面可见，也不会伪造切换成功。
+- enumerates DeepSeek Harness sessions and exposes their native IDs, titles, working directories, running state, model, permission and session statistics
+- reads Harness history and projects it into Prism turns, retaining user messages and final assistant output while filtering Harness-injected prompt content and intermediate assistant steps
+- selects an existing session from the visible Harness desktop sidebar and verifies the selected native session before returning success
+- creates a new Harness session from a Prism draft and sends the first message through the Harness RPC contract
+- sends text, supported images and UTF-8 text/code files to Harness; image and text attachments are converted to the descriptor expected by the current Typert gateway
+- switches model and reasoning effort through Harness controls when the current model catalog exposes those options
+- switches supported permission presets through the Harness command contract
+- interrupts a running Harness session, waits for completion and publishes foreground/session status changes to Hub
+- reads and publishes Harness token usage, context pressure and session statistics when available
+- maps native tool approvals to Prism approval events and sends allow-once or reject responses back to Harness
+- maps native `ask_user_question` cards to Prism `questionnaire` surfaces, including single choice, multiple choice, free text and skip actions
+- reads native Harness question cards directly from the desktop DOM as a CDP fallback when the mux event stream is unavailable; Panel responses operate the native option and submit controls
+- publishes reverse-sync session and foreground updates for Hub, desktop Panel and remote clients
 
-插件会自动探测新版点号路由和旧版 Typert 路由。旧版历史读取会转换为 `session/page`，模型目录转换为 `session/modelCatalog`，返回值再归一化为插件协议格式。
+## Current limits
 
-默认 API 地址为 `http://127.0.0.1:3080`，可通过 `DSH_API_BASE_URL` 覆盖。桌面应用当前通常会把 API 绑定到动态端口（例如 `64309`）。桌面应用的 HTTP 接口使用启动 URL token 换取本机 Cookie；如果 Hub 进程不是由 Harness 启动，请在插件环境中配置 `DSH_API_TOKEN`（启动 URL 的 token）或 `DSH_API_COOKIE`，插件会自动完成 Cookie 认证，不会把 token 写入日志。
+- desktop CDP mode is the supported path for a logged-in Harness desktop application; the native HTTP/WebSocket mode requires an explicit Harness launch token or cookie
+- Harness does not currently expose a stable account quota or subscription endpoint to this plugin; session token statistics are not presented as account quota
+- Harness does not expose a stable ordinary-session delete operation, so delete is intentionally unsupported
+- approval and question delivery depend on the native Harness UI remaining visible and structurally compatible; unsupported UI variants fail closed instead of inventing a remote surface
+- the CDP selectors are verified against current DeepSeek Harness desktop builds; future UI changes may require selector updates
+- full Windows desktop-control regression still needs to be run on a Windows machine, although endpoint discovery and filesystem handling avoid macOS-only shell commands
 
-默认桌面模式不需要 API token 或 Cookie：它在已登录的 Harness 页面内执行 RPC，并自动探测 `9222`、`9223`、`9333`。若安装包使用其他端口，可设置 `DSH_CDP_URL`（`/json/list` 地址或页面 WebSocket 地址；可用逗号分隔多个候选）或 `DSH_CDP_PORTS`（逗号分隔端口）。该探测只使用 Node 的 loopback HTTP 和 CDP WebSocket，在 macOS 与 Windows 上行为一致，不依赖 `lsof`、PowerShell 或 shell 命令。
+## Configuration
 
-Hub 支持将 DeepSeek Harness 以独立 Prism 资料目录托管启动：托管实例会通过 `DevToolsActivePort` 自动发现动态 CDP 端口。已经手动启动且暴露 CDP 的实例会保持远程可用，不会因为未托管而被标记为不可用；只有用户主动选择“重新托管”时，Hub 才会关闭并以托管模式重启该应用。
+普通用户优先在 Prism Desktop 的插件页配置应用路径、数据目录和托管启动，不需要手工复制登录信息或执行一次性的 shell `export`。
 
-## 能力边界
+开发者模式下可用的环境变量：
 
-插件会话详情展示 Harness 返回的 `tokenUsage`、`contextPressure` 和 `sessionStats`。Harness 当前没有稳定的公开账户额度接口，因此插件不会把会话 token 统计包装成账户套餐额度，`readAgentUsage()` 会返回空值。
+- `PRISM_PLUGIN_MODE`: `desktop`（默认）或 `native`
+- `DSH_CDP_URL`: 一个 `/json/list` 地址或页面 WebSocket 地址；支持逗号分隔多个候选
+- `DSH_CDP_PORTS`: CDP 端口候选列表；默认探测 `9222`、`9223`、`9333`
+- `PRISM_DSH_USER_DATA_DIR`: Chromium/Electron 用户数据目录；插件会读取其中的 `DevToolsActivePort`
+- `DSH_API_BASE_URL`: native 模式的 Harness API 地址，默认 `http://127.0.0.1:3080`
+- `DSH_API_TOKEN`: native 模式使用的 Harness 启动 URL token
+- `DSH_API_COOKIE`: native 模式使用的已认证 Cookie
 
-Harness 的普通会话没有公开删除接口，删除操作不声明支持。支持新版 mux 协议的桌面应用会把工具执行审批同步为 Prism 的审批卡片，并支持“仅允许一次”和“拒绝”回传；`ask_user_question` 会映射为 Prism 的多题问答界面，支持单选、多选、文本补充与跳过，并按 DSH 协议回传结构化答案。旧版 Harness 或交互下行通道不可用时，插件不会展示无法执行的远程交互。Hub 传入的 PNG、JPEG、WebP、GIF 图片会读取为 base64 后交给 Harness 的 `session.prompt`；MIME 缺失时会以同一组文件扩展名识别。最多 512 KiB 的 UTF-8 文本或代码文件会以内嵌内容发送。PDF、Office、压缩包、音视频和其他二进制附件会在发送前明确拒绝，避免 Panel 显示伪成功。
+desktop 模式优先使用 Harness 页面内的 RPC 和页面授权上下文。插件不会把
+token、Cookie 或签名 URL 写入日志，也不会在没有 CDP 授权时伪造在线状态。
+CDP 端口探测使用 Node 的 loopback HTTP/CDP WebSocket，在 macOS 和 Windows
+上采用同一套逻辑，不依赖 `lsof`、PowerShell 或其他平台命令。
 
-## 本地验证
+## Control-path notes
+
+- session selection、发送消息、模型/推理/权限切换、审批和问题回答都必须作用于当前已确认的 Harness 桌面会话
+- 桌面控制优先使用页面内 RPC；会话切换和问题/审批交互使用 CDP DOM 读取与原生控件操作，并在操作前重新校验目标身份
+- `ask_user_question` 通过标准 `interactive_surface` 发布；Panel 只提交当前 surface 的 opaque `surface_id` 和 `action_id`，插件再映射为 Harness 原生选项索引和提交动作
+- native HTTP/WebSocket 路径只在配置了有效授权时启用；收到 `401 Unauthorized` 不会尝试猜测或绕过认证
+- 附件只允许 Harness 当前已验证的图片和文本/code 类型；PDF、Office、压缩包、音视频及其他二进制文件会在发送前明确拒绝
+- 交互 surface、审批和前台详情均由真实 Harness 状态驱动；插件不维护会话内容的影子状态，也不通过深链或系统剪贴板伪造桌面操作
+
+## Local verification
 
 ```bash
 npm test
+npm run validate-manifest
 node index.js
 ```
 
-插件运行时由 Hub 注入 `PRISM_PLUGIN_MODE=native` 或 `PRISM_PLUGIN_MODE=desktop`。当前工作区的 Harness API 未监听 `127.0.0.1:3080` 时，`probe` 会返回不可用状态，插件不会伪造在线能力。
+Hub 运行插件时会注入 `PRISM_PLUGIN_MODE=desktop` 或
+`PRISM_PLUGIN_MODE=native`。desktop 模式下 Harness 必须已经登录并暴露 CDP
+端点；native 模式下必须同时提供可用的 API 授权。
