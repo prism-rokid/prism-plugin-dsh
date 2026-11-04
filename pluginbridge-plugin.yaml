@@ -4,7 +4,7 @@ display_name: DeepSeek Harness
 description: 连接本机 DeepSeek Harness，会话可在 Prism Hub、移动端和桌面端之间继续使用。
 icon_url: https://www.deepseek.com/harness/favicon.svg
 icon_svg_url: https://www.deepseek.com/harness/favicon.svg
-version: 0.1.0
+version: 0.1.1
 plugin_protocol_version: "4"
 min_hub_version: 0.1.0
 integration_mode: desktop-automation
