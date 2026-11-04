@@ -6,10 +6,14 @@
   "main": "index.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "validate-manifest": "node ../../prism-plugin-sdk/node/scripts/validate-manifest.mjs pluginbridge-plugin.yaml"
+    "validate-manifest": "node ../../prism-plugin-sdk/node/scripts/validate-manifest.mjs pluginbridge-plugin.yaml",
+    "verify-release": "node scripts/verify-release.mjs",
+    "probe": "node scripts/probe.mjs",
+    "stage-release": "node scripts/stage-release.mjs",
+    "create-release-metadata": "node scripts/create-release-metadata.mjs"
   },
   "dependencies": {
-    "@rokid-prism/pluginbridge-plugin-sdk": "^0.1.4"
+    "@rokid-prism/pluginbridge-plugin-sdk": "^0.1.1"
   },
   "engines": {
     "node": ">=22 <23"

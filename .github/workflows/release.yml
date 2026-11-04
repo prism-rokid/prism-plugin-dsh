@@ -1,0 +1,99 @@
+name: Release plugin
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      use_self_hosted:
+        description: 使用组织自托管 runner 构建 macOS ARM64 和 Windows x64
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-14
+            runner_labels: '["self-hosted","macOS","ARM64"]'
+          - target: macos-x64
+            runner: macos-15-intel
+            runner_labels: 'null'
+          - target: windows-x64
+            runner: windows-2022
+            runner_labels: '["self-hosted","Windows","X64"]'
+          - target: linux-x64
+            runner: ubuntu-22.04
+            runner_labels: 'null'
+    runs-on: ${{ inputs.use_self_hosted && fromJSON(matrix.runner_labels) || matrix.runner }}
+    env:
+      PRISM_PLATFORM: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+          registry-url: https://registry.npmmirror.com/
+          cache: npm
+      - name: 检查锁文件
+        shell: bash
+        run: test -f package-lock.json
+      - name: 安装锁定依赖
+        run: npm ci
+      - name: 构建并测试
+        run: |
+          npm run build --if-present
+          npm run validate-manifest
+          npm test
+          npm run verify-release
+      - name: 在目标 runner 执行协议探测
+        run: npm run probe
+      - name: 移除开发依赖
+        run: npm prune --omit=dev
+      - name: 暂存目标平台包
+        shell: bash
+        run: |
+          npm run stage-release
+          plugin_id=$(node -e "console.log(require('fs').readFileSync('pluginbridge-plugin.yaml','utf8').match(/^id:\\s*(.+)$/m)[1].trim())")
+          version=$(node -e "console.log(require('fs').readFileSync('pluginbridge-plugin.yaml','utf8').match(/^version:\\s*(.+)$/m)[1].trim())")
+          tar -C "release/${plugin_id}-${version}-${PRISM_PLATFORM}" -czf "$PWD/release/${plugin_id}-${version}-${PRISM_PLATFORM}.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-artifacts
+          merge-multiple: true
+      - name: 生成发布元数据
+        run: npm run create-release-metadata -- release-artifacts
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release delete "$GITHUB_REF_NAME" --yes
+          fi
+          gh release create "$GITHUB_REF_NAME" release-artifacts/* --verify-tag --title "DSH $GITHUB_REF_NAME" --generate-notes
