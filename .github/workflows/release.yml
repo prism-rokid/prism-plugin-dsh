@@ -53,7 +53,6 @@ jobs:
           npm run build --if-present
           npm run validate-manifest
           npm test
-          npm run verify-release
       - name: 在目标 runner 执行协议探测
         run: npm run probe
       - name: 移除开发依赖

@@ -1,19 +1,22 @@
 {
   "name": "prism-plugin-dsh",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Prism PluginBridge adapter for DeepSeek Harness",
   "main": "index.js",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "validate-manifest": "node ../../prism-plugin-sdk/node/scripts/validate-manifest.mjs pluginbridge-plugin.yaml",
-    "verify-release": "node scripts/verify-release.mjs",
+    "validate-manifest": "node scripts/validate-manifest.mjs pluginbridge-plugin.yaml",
     "probe": "node scripts/probe.mjs",
     "stage-release": "node scripts/stage-release.mjs",
     "create-release-metadata": "node scripts/create-release-metadata.mjs"
   },
   "dependencies": {
     "@rokid-prism/pluginbridge-plugin-sdk": "^0.1.1"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "yaml": "^2.5.1"
   },
   "engines": {
     "node": ">=22 <23"

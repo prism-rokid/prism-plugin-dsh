@@ -11,7 +11,7 @@ if (!platform || !id || !version) throw new Error("需要 PRISM_PLATFORM、插�
 const destination = resolve(root, "release", `${id}-${version}-${platform}`);
 await rm(destination, { recursive: true, force: true });
 await mkdir(destination, { recursive: true });
-const skip = new Set([".git", ".github", ".agents", "release", "scripts", "test", ".DS_Store"]);
+const skip = new Set([".git", ".github", ".agents", "conformance", "release", "scripts", "test", ".DS_Store"]);
 for (const entry of await readdir(root)) if (!skip.has(entry)) await cp(resolve(root, entry), resolve(destination, entry), { recursive: true, verbatimSymlinks: true });
 
 async function assertNoAbsoluteSymlinks(directory) {

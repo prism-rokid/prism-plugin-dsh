@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Rokid-Prism/prism-plugin-sdk/blob/main/conformance/manifest.schema.json",
+  "title": "PluginBridge v4 plugin manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "display_name", "version", "integration_mode", "transport", "command", "capabilities"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "plugin_protocol_version": { "const": "4" },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{0,127}$" },
+    "display_name": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "description": { "type": "string", "maxLength": 4096 },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+    "min_hub_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+    "icon_url": { "$ref": "#/$defs/httpsUrl" },
+    "icon_svg_url": { "$ref": "#/$defs/httpsUrl" },
+    "integration_mode": { "enum": ["protocol-native", "desktop-automation"] },
+    "transport": { "enum": ["process", "stdio"] },
+    "command": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1, "maxLength": 4096 } },
+    "socket_path": { "type": "string", "maxLength": 4096 },
+    "endpoint": { "type": "string", "maxLength": 4096 },
+    "mode": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "runtime_modes": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+    "default_runtime_mode": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "runtime_controls": { "$ref": "#/$defs/runtimeControls" },
+    "runtime_operations": { "$ref": "#/$defs/runtimeOperations" },
+    "managed_terminal_modes": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 128 } },
+    "managed_launch": { "type": "boolean" },
+    "managed_launch_specs": { "type": "array", "items": { "$ref": "#/$defs/managedLaunchSpec" } },
+    "runtime_dependencies": { "type": "object", "additionalProperties": false, "properties": { "node": { "type": "string", "minLength": 1, "maxLength": 128 } } },
+    "capabilities": { "$ref": "#/$defs/capabilities" }
+  },
+  "$defs": {
+    "httpsUrl": { "type": "string", "maxLength": 1024, "pattern": "^https://[^\\s/@?#]+(?:[/?#][^\\s]*)?$" },
+    "runtimeControls": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "model": { "enum": ["stable", "interactive"] },
+          "reasoning": { "enum": ["stable", "interactive"] },
+          "permission": { "enum": ["stable", "interactive"] }
+        }
+      }
+    },
+    "runtimeOperations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rename": { "enum": ["direct", "menu", "unsupported"] },
+          "pin": { "enum": ["direct", "menu", "unsupported"] },
+          "archive": { "enum": ["direct", "menu", "unsupported"] },
+          "delete": { "enum": ["direct", "menu", "unsupported"] }
+        }
+      }
+    },
+    "managedLaunchSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "enum": ["desktop-app", "service"] },
+        "app": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "start": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 4096 } },
+        "stop": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 4096 } },
+        "ready": { "enum": ["probe", "exit_ok"] },
+        "ready_timeout_ms": { "type": "integer", "minimum": 5000, "maximum": 120000 },
+        "runtime_modes": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 128 } }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "native_visible_input": { "type": "boolean" },
+        "native_visible_output": { "type": "boolean" },
+        "can_attach_session": { "type": "boolean" },
+        "can_start_session_with_message": { "type": "boolean" },
+        "can_open_draft": { "type": "boolean" },
+        "can_list_sessions": { "type": "boolean" },
+        "can_read_history": { "type": "boolean" },
+        "can_interrupt": { "type": "boolean" },
+        "can_approval": { "type": "boolean" },
+        "can_forward_sync": { "type": "boolean" },
+        "can_reverse_sync": { "type": "boolean" },
+        "can_plugin_wide_watch": { "type": "boolean" },
+        "can_wait_run": { "type": "boolean" },
+        "can_read_status": { "type": "boolean" },
+        "can_control_session": { "type": "boolean" },
+        "can_open_managed_terminal": { "type": "boolean" }
+      }
+    }
+  }
+}
