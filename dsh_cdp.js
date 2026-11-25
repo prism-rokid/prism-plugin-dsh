@@ -2,10 +2,15 @@
 
 const crypto = require("crypto");
 const fs = require("fs/promises");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
 const { firstText } = require("./dsh_client");
 
 const DEFAULT_CDP_PORTS = [9222, 9223, 9333];
 const CDP_PAGE_OPERATION_TIMEOUT_MS = 5000;
+// 进程端点来源只用于兜底，短期缓存避免 watcher 的每次 RPC 都重新枚举进程。
+const PROCESS_ENDPOINT_TTL_MS = 5000;
+const execFileAsync = promisify(execFile);
 
 function cdpHttpUrl(value) {
   const raw = firstText(value);
@@ -27,6 +32,66 @@ function cdpCandidates(endpoint, ports) {
     .filter(Boolean);
   for (const port of configuredCdpPorts(ports)) candidates.push(`http://127.0.0.1:${port}`);
   return [...new Set(candidates)];
+}
+
+// Chromium 只在显式启动参数中记录 --user-data-dir，并且同时支持
+// --flag=value 与 --flag value。路径可能包含空格，所以值一直取到下一个
+// -- 开关或行尾，不能按第一个空格截断。
+function commandUserDataDir(command = "") {
+  const match = String(command || "").match(/(?:^|\s)--user-data-dir(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(.+?))(?=\s+--|$)/);
+  return firstText(match && match[1], match && match[2], match && match[3]);
+}
+
+function commandRemoteDebuggingPort(command = "") {
+  const match = String(command || "").match(/(?:^|\s)--remote-debugging-port(?:=|\s+)(\d+)/);
+  const port = Number(match && match[1]);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 0;
+}
+
+// 只认 DeepSeek Harness 桌面主进程：Chromium 的 renderer/GPU 子进程会继承
+// 调试参数，但它们没有可连接的 CDP 主页面。
+function dshDesktopMainProcesses(processes) {
+  return (Array.isArray(processes) ? processes : []).filter((proc) => {
+    const command = String(proc && proc.command || "");
+    if (!/deepseek[- _]?harness/i.test(command)) return false;
+    if (/(?:^|\s)--type(?:=|\s)/.test(command)) return false;
+    return /--remote-debugging-port(?:=|\s)/.test(command);
+  });
+}
+
+function windowsProcessesFromJSON(output = "") {
+  const text = String(output || "").trim();
+  if (!text || text === "null") return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return [];
+  }
+  const values = Array.isArray(parsed) ? parsed : [parsed];
+  return values
+    .map((value) => ({
+      pid: Number(value && (value.ProcessId ?? value.processId)),
+      command: firstText(value && (value.CommandLine ?? value.commandLine)),
+    }))
+    .filter((value) => value.pid && value.command);
+}
+
+async function listDesktopProcesses() {
+  if (process.platform === "win32") {
+    const command = "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+      timeout: 5000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return windowsProcessesFromJSON(stdout);
+  }
+  // -ww 保留完整命令行，避免 ps 按终端宽度截断调试参数。
+  const { stdout } = await execFileAsync("ps", ["-ww", "-axo", "pid=,command="], { timeout: 4000, maxBuffer: 4 * 1024 * 1024 });
+  return String(stdout || "").split("\n").map((line) => {
+    const match = line.match(/^\s*(\d+)\s+(.+)$/);
+    return match ? { pid: Number(match[1]), command: match[2] } : null;
+  }).filter(Boolean);
 }
 
 function legacyRoute(name) {
@@ -87,6 +152,8 @@ class DshDesktopController {
     this.cdpPorts = options.ports || process.env.DSH_CDP_PORTS || "";
     this.userDataDir = options.userDataDir || process.env.PRISM_DSH_USER_DATA_DIR || "";
     this.readFile = options.readFile || fs.readFile;
+    this.listProcesses = options.listProcesses || listDesktopProcesses;
+    this.processEndpointCache = { at: 0, endpoints: [] };
     this.pageOperationTimeoutMs = Number(options.pageOperationTimeoutMs || CDP_PAGE_OPERATION_TIMEOUT_MS);
     this.rpcFlavor = null;
     this.confirmedSessionId = "";
@@ -95,9 +162,12 @@ class DshDesktopController {
 
   async resolvePage() {
     const profilePorts = await this.profileCdpPorts();
+    const processEndpoints = await this.processCdpEndpoints();
     const endpoints = [...new Set([
       ...profilePorts.map((port) => `http://127.0.0.1:${port}`),
-      ...cdpCandidates(this.explicitEndpoint, this.cdpPorts),
+      ...cdpCandidates(this.explicitEndpoint, ""),
+      ...processEndpoints,
+      ...cdpCandidates("", this.cdpPorts),
     ])];
     for (const endpoint of endpoints) {
       try {
@@ -112,7 +182,7 @@ class DshDesktopController {
         // 未开启该端口是正常情况，继续探测下一个端点。
       }
     }
-    throw new Error("未发现 DeepSeek Harness 的 CDP 调试端点；请以 --remote-debugging-port 启动桌面应用，或设置 DSH_CDP_URL/DSH_CDP_PORTS。");
+    throw new Error("未发现 DeepSeek Harness 的 CDP 调试端点；请以 --remote-debugging-port 启动桌面应用，或设置 DSH_CDP_URL/DSH_CDP_PORTS。已在运行但未带调试端口的应用需要重启。");
   }
 
   async profileCdpPorts() {
@@ -125,6 +195,40 @@ class DshDesktopController {
     } catch {
       return [];
     }
+  }
+
+  /**
+   * 端口文件与显式配置都失效时，从运行中的桌面主进程恢复实际端点：读取其
+   * --remote-debugging-port 参数和 --user-data-dir 下的动态端口文件。多个主
+   * 进程说明无法确认目标实例，此时不猜测端口。
+   */
+  async processCdpEndpoints() {
+    const now = Date.now();
+    if (now - this.processEndpointCache.at < PROCESS_ENDPOINT_TTL_MS) return this.processEndpointCache.endpoints;
+    let endpoints = [];
+    try {
+      const mains = dshDesktopMainProcesses(await this.listProcesses());
+      if (mains.length === 1) {
+        const ports = new Set();
+        const port = commandRemoteDebuggingPort(mains[0].command);
+        if (port) ports.add(port);
+        const userDataDir = commandUserDataDir(mains[0].command);
+        if (userDataDir) {
+          try {
+            const content = await this.readFile(require("path").join(userDataDir, "DevToolsActivePort"), "utf8");
+            const filePort = Number(String(content).split(/\r?\n/, 1)[0]);
+            if (Number.isInteger(filePort) && filePort > 0) ports.add(filePort);
+          } catch {
+            // 未生成端口文件时只使用命令行中的显式端口。
+          }
+        }
+        endpoints = [...ports].map((value) => `http://127.0.0.1:${value}`);
+      }
+    } catch {
+      endpoints = [];
+    }
+    this.processEndpointCache = { at: now, endpoints };
+    return endpoints;
   }
 
   async withPage(callback) {
@@ -755,4 +859,5 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-module.exports = { DshDesktopController, cdpCandidates, configuredCdpPorts, nativeQuestionAnswer };
+module.exports = { DshDesktopController, cdpCandidates, configuredCdpPorts, commandUserDataDir, commandRemoteDebuggingPort,
+  dshDesktopMainProcesses, nativeQuestionAnswer };

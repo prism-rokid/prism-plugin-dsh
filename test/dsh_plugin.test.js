@@ -694,6 +694,73 @@ test("CDP 探测优先读取托管桌面应用的动态端口文件", async () =
   assert.equal(visited[0], "http://127.0.0.1:18443/json/list");
 });
 
+test("桌面进程的参数按完整值解析调试端口与用户数据目录", () => {
+  const { commandRemoteDebuggingPort, commandUserDataDir, dshDesktopMainProcesses } = require("../dsh_cdp");
+  const app = "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness";
+  assert.equal(commandRemoteDebuggingPort(`${app} --remote-debugging-port=61234`), 61234);
+  assert.equal(commandRemoteDebuggingPort(`${app} --remote-debugging-port 61234`), 61234);
+  assert.equal(commandRemoteDebuggingPort(`${app} --remote-debugging-port=0`), 0);
+  assert.equal(commandRemoteDebuggingPort(app), 0);
+  assert.equal(commandUserDataDir(`${app} --user-data-dir="/tmp/dsh profile" --remote-debugging-port=0`), "/tmp/dsh profile");
+  assert.equal(commandUserDataDir(`${app} --user-data-dir=/tmp/dsh profile`), "/tmp/dsh profile");
+  assert.equal(commandUserDataDir(app), "");
+  assert.deepEqual(dshDesktopMainProcesses([
+    { pid: 1, command: `${app} --remote-debugging-port=61234` },
+    { pid: 2, command: `${app} Helper --type=renderer --remote-debugging-port=61234` },
+    { pid: 3, command: "/usr/bin/other --remote-debugging-port=61234" },
+    { pid: 4, command: app },
+  ]).map((proc) => proc.pid), [1]);
+});
+
+test("CDP 探测从运行中的桌面主进程恢复实际调试端口", async () => {
+  const controller = new DshDesktopController({
+    listProcesses: async () => [
+      { pid: 10, command: "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --remote-debugging-port=61234" },
+      { pid: 11, command: "/Applications/DeepSeek Harness.app/Contents/Frameworks/Helpers/Harness Helper --type=renderer --remote-debugging-port=61234" },
+    ],
+  });
+  controller.fetch = async (url) => url === "http://127.0.0.1:61234/json/list"
+    ? { ok: true, json: async () => [{ type: "page", title: "DeepSeek Harness", url: "dsh-app://app/", webSocketDebuggerUrl: "ws://127.0.0.1:61234/devtools/page/abc" }] }
+    : { ok: false };
+  const page = await controller.resolvePage();
+  assert.equal(page.source, "http://127.0.0.1:61234");
+  assert.equal(page.webSocketDebuggerUrl, "ws://127.0.0.1:61234/devtools/page/abc");
+});
+
+test("CDP 探测从桌面进程的用户数据目录读取动态端口", async () => {
+  const controller = new DshDesktopController({
+    listProcesses: async () => [{
+      pid: 12,
+      command: "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --user-data-dir=/tmp/dsh profile --remote-debugging-port=0",
+    }],
+    readFile: async (file) => {
+      assert.equal(file, path.join("/tmp/dsh profile", "DevToolsActivePort"));
+      return "18443\n/devtools/browser/example\n";
+    },
+  });
+  controller.fetch = async (url) => url === "http://127.0.0.1:18443/json/list"
+    ? { ok: true, json: async () => [{ type: "page", title: "Harness", url: "dsh-app://app/", webSocketDebuggerUrl: "ws://127.0.0.1:18443/devtools/page/x" }] }
+    : { ok: false };
+  const page = await controller.resolvePage();
+  assert.equal(page.source, "http://127.0.0.1:18443");
+});
+
+test("多个桌面主进程时不猜测 CDP 端口", async () => {
+  const controller = new DshDesktopController({
+    listProcesses: async () => [
+      { pid: 21, command: "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --remote-debugging-port=60001" },
+      { pid: 22, command: "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness --remote-debugging-port=60002" },
+    ],
+  });
+  const visited = [];
+  controller.fetch = async (url) => {
+    visited.push(url);
+    return { ok: false };
+  };
+  await assert.rejects(() => controller.resolvePage(), /未发现 DeepSeek Harness/);
+  assert.equal(visited.some((url) => url.includes("60001") || url.includes("60002")), false);
+});
+
 test("CDP 页面操作超时后关闭连接以便 watcher 重试", async () => {
   const controller = new DshDesktopController({ pageOperationTimeoutMs: 10 });
   let closed = false;
