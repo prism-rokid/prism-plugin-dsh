@@ -75,6 +75,13 @@ function dshExecutableCandidate(candidate, platform = process.platform) {
   return value;
 }
 
+function isDesktopApplicationPath(candidate, platform = process.platform) {
+  const value = String(candidate || "");
+  if (platform === "darwin") return value.endsWith(".app") || /DeepSeek Harness(?:$|[\\/])/i.test(value);
+  if (platform === "win32") return /DeepSeek Harness\.exe$/i.test(value);
+  return /deepseek[\s_-]*harness/i.test(value) && !/(?:^|[\\/])dsh(?:[-_ ]?cli)?(?:\.exe)?$/i.test(value);
+}
+
 function dshDesktopProcessMatch(command, appPath = "") {
   const value = String(command || "");
   if (!value || /(?:dsh[-_ ]?cli|(?:^|[\\/])cli(?:\.exe)?(?:\s|$))/i.test(value)) return false;
@@ -233,6 +240,9 @@ class DshDesktopController {
     this.platform = options.platform || process.platform;
     this.env = options.env || process.env;
     this.home = options.home || os.homedir();
+    this.appPaths = Array.isArray(options.appPaths) && options.appPaths.length
+      ? options.appPaths.map((value) => String(value)).filter(Boolean)
+      : null;
     this.diagnosticTimeoutMs = Number(options.diagnosticTimeoutMs || DIAGNOSTIC_TIMEOUT_MS);
     this.verifyPage = options.verifyPage || ((pageInfo) => this.verifyCdpPage(pageInfo));
     this.processEndpointCache = { at: 0, endpoints: [] };
@@ -243,8 +253,9 @@ class DshDesktopController {
   }
 
   async installedApplication() {
-    const candidates = dshAppCandidates(this.platform, this.env, this.home);
+    const candidates = this.appPaths || dshAppCandidates(this.platform, this.env, this.home);
     for (const candidate of candidates) {
+      if (!isDesktopApplicationPath(candidate, this.platform)) continue;
       const checkPath = dshExecutableCandidate(candidate, this.platform);
       if (!checkPath) continue;
       try {
