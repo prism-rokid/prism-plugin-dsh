@@ -2,17 +2,92 @@
 
 const crypto = require("crypto");
 const fs = require("fs/promises");
+const os = require("os");
 const path = require("path");
-const { homedir } = require("os");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const { firstText } = require("./dsh_client");
 
 const DEFAULT_CDP_PORTS = [9222, 9223, 9333];
 const CDP_PAGE_OPERATION_TIMEOUT_MS = 5000;
+const DIAGNOSTIC_TIMEOUT_MS = 8000;
+const MAX_DIAGNOSTIC_STACK_LENGTH = 4096;
 // 进程端点来源只用于兜底，短期缓存避免 watcher 的每次 RPC 都重新枚举进程。
 const PROCESS_ENDPOINT_TTL_MS = 5000;
 const execFileAsync = promisify(execFile);
+
+function diagnosticErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error || "未知错误");
+}
+
+function sanitizeDiagnosticText(value, maxLength = MAX_DIAGNOSTIC_STACK_LENGTH) {
+  let text = String(value || "")
+    .replace(/authorization\s*:\s*(?:bearer\s+)?[^\s,;]+/gi, "Authorization: <已脱敏>")
+    .replace(/bearer\s+[^\s,;]+/gi, "Bearer <已脱敏>")
+    .replace(/((?:token|access[_-]?token|refresh[_-]?token|api[_-]?key|password|passwd|cookie)\s*[=:]\s*)[^\s,;]+/gi, "$1<已脱敏>")
+    .replace(/(Cookie\s*:\s*)[^\r\n]+/gi, "$1<已脱敏>")
+    .replace(/\/Users\/[^/\s]+/g, "/Users/<用户>")
+    .replace(/C:\\Users\\[^\\\s]+/gi, "C:\\Users\\<用户>")
+    .replace(/C:\\Users\\[^\\]+/gi, "C:\\Users\\<用户>");
+  if (text.length > maxLength) text = `${text.slice(0, maxLength)}…`;
+  return text;
+}
+
+function diagnosticResult(state, code, summary, detail, facts, actions = ["recheck"], stack = "") {
+  return {
+    State: state, Code: code, Summary: summary, Detail: detail,
+    Component: "DeepSeek Harness", Actions: actions, Facts: facts,
+    Stack: sanitizeDiagnosticText(stack),
+  };
+}
+
+function dshAppCandidates(platform = process.platform, env = process.env, home = os.homedir()) {
+  const configured = firstText(env.PRISM_DSH_APP_PATH, env.PRISM_DSH_APP_EXECUTABLE);
+  if (configured) return [configured];
+  if (platform === "darwin") {
+    return [
+      "/Applications/DeepSeek Harness.app",
+      path.join(home, "Applications", "DeepSeek Harness.app"),
+    ];
+  }
+  if (platform === "win32") {
+    return [
+      env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, "Programs", "DeepSeek Harness", "DeepSeek Harness.exe") : "",
+      env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, "DeepSeek Harness", "DeepSeek Harness.exe") : "",
+      env.ProgramFiles ? path.join(env.ProgramFiles, "DeepSeek Harness", "DeepSeek Harness.exe") : "",
+      env.ProgramW6432 ? path.join(env.ProgramW6432, "DeepSeek Harness", "DeepSeek Harness.exe") : "",
+      env["ProgramFiles(x86)"] ? path.join(env["ProgramFiles(x86)"], "DeepSeek Harness", "DeepSeek Harness.exe") : "",
+    ].filter(Boolean);
+  }
+  return [
+    "/opt/DeepSeek Harness/DeepSeek Harness",
+    "/opt/deepseek-harness/DeepSeek Harness",
+    path.join(home, ".local", "share", "deepseek-harness", "DeepSeek Harness"),
+    path.join(home, ".local", "share", "deepseek-harness", "DeepSeek Harness.AppImage"),
+    path.join(home, ".local", "bin", "deepseek-harness"),
+  ];
+}
+
+function dshExecutableCandidate(candidate, platform = process.platform) {
+  const value = String(candidate || "");
+  if (platform === "darwin" && value.endsWith(".app")) return path.join(value, "Contents", "MacOS", "DeepSeek Harness");
+  return value;
+}
+
+function dshDesktopProcessMatch(command, appPath = "") {
+  const value = String(command || "");
+  if (!value || /(?:dsh[-_ ]?cli|(?:^|[\\/])cli(?:\.exe)?(?:\s|$))/i.test(value)) return false;
+  if (appPath && value.toLowerCase().includes(String(appPath).toLowerCase())) return true;
+  return /deepseek[\s_-]*harness(?:\.exe)?/i.test(value);
+}
+
+function dshDesktopProcesses(processes, options = {}) {
+  return (Array.isArray(processes) ? processes : []).filter((proc) => {
+    const command = String(proc && proc.command || "");
+    if (!dshDesktopProcessMatch(command, options.appPath)) return false;
+    return !/(?:^|\s)--type(?:=|\s)/.test(command);
+  });
+}
 
 function cdpHttpUrl(value) {
   const raw = firstText(value);
@@ -53,45 +128,10 @@ function commandRemoteDebuggingPort(command = "") {
 // 只认 DeepSeek Harness 桌面主进程：Chromium 的 renderer/GPU 子进程会继承
 // 调试参数，但它们没有可连接的 CDP 主页面。
 function dshDesktopMainProcesses(processes) {
-  return (Array.isArray(processes) ? processes : []).filter((proc) => {
+  return dshDesktopProcesses(processes).filter((proc) => {
     const command = String(proc && proc.command || "");
-    if (!/deepseek[- _]?harness/i.test(command)) return false;
-    if (/(?:^|\s)--type(?:=|\s)/.test(command)) return false;
     return /--remote-debugging-port(?:=|\s)/.test(command);
   });
-}
-
-class DesktopProbeError extends Error {
-  constructor(phase, detail) {
-    super(detail);
-    this.phase = phase;
-  }
-}
-
-function desktopExecutable(proc, platform) {
-  const command = String(proc?.command || "");
-  if (/(?:^|\s)--type(?:=|\s)/.test(command)) return "";
-  if (platform === "win32") {
-    const executable = String(proc?.executablePath || "");
-    return /^deepseek harness\.exe$/i.test(path.win32.basename(executable)) ? executable : "";
-  }
-  const executable = String(proc?.executablePath || "");
-  return /^((?:\/[^/]+)*\/DeepSeek Harness\.app\/Contents\/MacOS\/DeepSeek Harness)$/.exec(executable)?.[1] || "";
-}
-
-function desktopPaths(platform, env, home) {
-  const configured = env.PRISM_DSH_APP_PATH;
-  if (platform === "win32") return [
-    configured,
-    env.LOCALAPPDATA && path.win32.join(env.LOCALAPPDATA, "Programs", "DeepSeek Harness", "DeepSeek Harness.exe"),
-    env.ProgramFiles && path.win32.join(env.ProgramFiles, "DeepSeek Harness", "DeepSeek Harness.exe"),
-  ].filter(Boolean);
-  const executable = "DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness";
-  return [
-    configured && (configured.endsWith(".app") ? path.join(configured, "Contents/MacOS/DeepSeek Harness") : configured),
-    path.join("/Applications", executable),
-    path.join(home, "Applications", executable),
-  ].filter(Boolean);
 }
 
 function windowsProcessesFromJSON(output = "") {
@@ -108,14 +148,13 @@ function windowsProcessesFromJSON(output = "") {
     .map((value) => ({
       pid: Number(value && (value.ProcessId ?? value.processId)),
       command: firstText(value && (value.CommandLine ?? value.commandLine)),
-      ...(value?.ExecutablePath ? { executablePath: value.ExecutablePath } : {}),
     }))
     .filter((value) => value.pid && value.command);
 }
 
 async function listDesktopProcesses() {
   if (process.platform === "win32") {
-    const command = "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine,ExecutablePath | ConvertTo-Json -Compress";
+    const command = "Get-CimInstance Win32_Process | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress";
     const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
       timeout: 5000,
       maxBuffer: 4 * 1024 * 1024,
@@ -123,14 +162,11 @@ async function listDesktopProcesses() {
     return windowsProcessesFromJSON(stdout);
   }
   // -ww 保留完整命令行，避免 ps 按终端宽度截断调试参数。
-  const options = { timeout: 4000, maxBuffer: 4 * 1024 * 1024 };
-  const [commands, executables] = await Promise.all([
-    execFileAsync("ps", ["-ww", "-axo", "pid=,command="], options),
-    execFileAsync("ps", ["-ww", "-axo", "pid=,comm="], options),
-  ]);
-  const rows = text => String(text || "").split("\n").map(line => /^\s*(\d+)\s+(.+?)\s*$/.exec(line)).filter(Boolean);
-  const paths = new Map(rows(executables.stdout).map(match => [match[1], match[2]]));
-  return rows(commands.stdout).map(match => ({ pid: Number(match[1]), command: match[2], executablePath: paths.get(match[1]) }));
+  const { stdout } = await execFileAsync("ps", ["-ww", "-axo", "pid=,command="], { timeout: 4000, maxBuffer: 4 * 1024 * 1024 });
+  return String(stdout || "").split("\n").map((line) => {
+    const match = line.match(/^\s*(\d+)\s+(.+)$/);
+    return match ? { pid: Number(match[1]), command: match[2] } : null;
+  }).filter(Boolean);
 }
 
 function legacyRoute(name) {
@@ -191,10 +227,13 @@ class DshDesktopController {
     this.cdpPorts = options.ports || process.env.DSH_CDP_PORTS || "";
     this.userDataDir = options.userDataDir || process.env.PRISM_DSH_USER_DATA_DIR || "";
     this.readFile = options.readFile || fs.readFile;
+    this.stat = options.stat || fs.stat;
     this.listProcesses = options.listProcesses || listDesktopProcesses;
     this.platform = options.platform || process.platform;
-    this.appPaths = options.appPaths || desktopPaths(this.platform, process.env, homedir());
-    this.stat = options.stat || fs.stat;
+    this.env = options.env || process.env;
+    this.home = options.home || os.homedir();
+    this.diagnosticTimeoutMs = Number(options.diagnosticTimeoutMs || DIAGNOSTIC_TIMEOUT_MS);
+    this.verifyPage = options.verifyPage || ((pageInfo) => this.verifyCdpPage(pageInfo));
     this.processEndpointCache = { at: 0, endpoints: [] };
     this.pageOperationTimeoutMs = Number(options.pageOperationTimeoutMs || CDP_PAGE_OPERATION_TIMEOUT_MS);
     this.rpcFlavor = null;
@@ -202,53 +241,155 @@ class DshDesktopController {
     this.foregroundRevision = 0;
   }
 
+  async installedApplication() {
+    const candidates = dshAppCandidates(this.platform, this.env, this.home);
+    for (const candidate of candidates) {
+      const checkPath = dshExecutableCandidate(candidate, this.platform);
+      if (!checkPath) continue;
+      try {
+        const info = await this.stat(checkPath);
+        if (info && (typeof info.isFile !== "function" || info.isFile() || info.isDirectory?.())) {
+          return { installed: true, path: candidate };
+        }
+      } catch {
+        // 路径不存在时继续检查其他平台候选路径。
+      }
+      // macOS 应用包本身存在也表示桌面端已安装，实际可执行文件缺失时仍让后续状态说明启动问题。
+      if (this.platform === "darwin" && candidate.endsWith(".app")) {
+        try {
+          const info = await this.stat(candidate);
+          if (info && (info.isDirectory?.() || info.isFile?.())) return { installed: true, path: candidate };
+        } catch {
+          // 继续检查其他候选路径。
+        }
+      }
+    }
+    return { installed: false, path: "" };
+  }
+
+  async runningApplication(appPath = "") {
+    try {
+      const processes = await this.listProcesses();
+      const matches = dshDesktopProcesses(processes, { appPath });
+      return { running: matches.length > 0, processes: matches };
+    } catch (error) {
+      return { running: false, processes: [], error };
+    }
+  }
+
+  async cdpInspection() {
+    const profilePorts = await this.profileCdpPorts();
+    const processEndpoints = await this.processCdpEndpoints();
+    const endpoints = [...new Set([
+      ...profilePorts.map((port) => `http://127.0.0.1:${port}`),
+      ...cdpCandidates(this.explicitEndpoint, ""),
+      ...processEndpoints,
+      ...cdpCandidates("", this.cdpPorts),
+    ])];
+    const failures = [];
+    let reached = false;
+    for (const endpoint of endpoints) {
+      if (endpoint.startsWith("ws")) {
+        const page = { webSocketDebuggerUrl: endpoint, source: "环境变量" };
+        try {
+          if (await this.verifyPage(page)) return { reachable: true, page, failures };
+          return { reachable: false, page: null, pageConnectionFailed: true, failures: [...failures, `${endpoint} WebSocket 连接失败`] };
+        } catch (error) {
+          return { reachable: false, page: null, pageConnectionFailed: true, failures: [...failures, `${endpoint} ${diagnosticErrorMessage(error)}`] };
+        }
+      }
+      try {
+        const response = await this.fetch(`${endpoint}/json/list`, { signal: AbortSignal.timeout(1200) });
+        if (!response || !response.ok) {
+          failures.push(`${endpoint} HTTP ${response && response.status ? response.status : "不可访问"}`);
+          continue;
+        }
+        reached = true;
+        const targets = await response.json();
+        const page = Array.isArray(targets) && targets.find((item) => item && item.type === "page" && item.webSocketDebuggerUrl
+          && /deepseek|harness|dsh/i.test(`${item.title || ""} ${item.url || ""}`));
+        if (page) {
+          const pageInfo = { ...page, source: endpoint };
+          try {
+            if (await this.verifyPage(pageInfo)) return { reachable: true, page: pageInfo, failures };
+            return { reachable: false, page: null, pageConnectionFailed: true, failures: [...failures, `${endpoint} WebSocket 连接失败`] };
+          } catch (error) {
+            return { reachable: false, page: null, pageConnectionFailed: true, failures: [...failures, `${endpoint} ${diagnosticErrorMessage(error)}`] };
+          }
+        }
+      } catch (error) {
+        failures.push(`${endpoint} ${diagnosticErrorMessage(error)}`);
+      }
+    }
+    return { reachable: reached, page: null, failures };
+  }
+
+  async diagnose() {
+    const facts = { installed: false, running: false, transport: "cdp", transport_reachable: false };
+    let timeout;
+    try {
+      const result = await Promise.race([
+        (async () => {
+          const installation = await this.installedApplication();
+          facts.installed = installation.installed;
+          if (!installation.installed) {
+            return diagnosticResult("not_installed", "app_not_installed", "未安装 DeepSeek Harness 桌面端", "未找到 DeepSeek Harness 桌面程序文件；插件目录、CLI 或 Node 包不会被视为桌面端安装。", facts, ["open_download", "locate_agent", "recheck"]);
+          }
+          const running = await this.runningApplication(installation.path);
+          facts.running = running.running;
+          if (!running.running) {
+            return diagnosticResult("not_running", "not_running", "已安装，尚未启动", "已找到 DeepSeek Harness 桌面端，但当前没有运行中的桌面进程。", facts, ["managed_relaunch", "recheck"], running.error && running.error.stack);
+          }
+          const cdp = await this.cdpInspection();
+          facts.transport_reachable = Boolean(cdp.reachable);
+          if (!cdp.reachable) {
+            return diagnosticResult("unavailable", "control_channel_unreachable", "已运行，但 CDP 未连通", "DeepSeek Harness 正在运行，但 Prism 无法连接 CDP 控制通道。", facts, ["managed_relaunch", "recheck"], cdp.failures.join("\n"));
+          }
+          if (!cdp.page) {
+            return diagnosticResult("unavailable", "cdp_page_unavailable", "控制页面不可用", "CDP 已连通，但未找到 DeepSeek Harness 控制页面。", facts, ["managed_relaunch", "recheck"], cdp.failures.join("\n"));
+          }
+          try {
+            await this.probe();
+          } catch (error) {
+            const stack = diagnosticErrorMessage(error);
+            const code = /404|握手|envelope|无效信封|not found/i.test(stack) ? "rpc_handshake_failed" : "rpc_unavailable";
+            return diagnosticResult("unavailable", code, code === "rpc_handshake_failed" ? "控制页面已连接，但 RPC 握手失败" : "控制页面已连接，但 RPC 不可用", `DeepSeek Harness 控制页面可访问，但 RPC 探测失败：${sanitizeDiagnosticText(stack, 1000)}`, facts, ["managed_relaunch", "recheck"], error && error.stack);
+          }
+          return diagnosticResult("ready", "ready", "DeepSeek Harness 已连接", "桌面程序、进程、CDP 控制页面和 RPC 均可用。", facts);
+        })(),
+        new Promise((resolve) => { timeout = setTimeout(() => resolve(diagnosticResult("unavailable", "diagnostic_timeout", "DeepSeek Harness 状态探测超时", "状态探测超过允许时间，下一次 Probe 将重新尝试。", facts, ["recheck"])), this.diagnosticTimeoutMs); }),
+      ]);
+      return result;
+    } catch (error) {
+      return diagnosticResult("unavailable", "diagnostic_failed", "DeepSeek Harness 状态探测失败", sanitizeDiagnosticText(diagnosticErrorMessage(error), 1000), facts, ["recheck"], error && error.stack);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
   async resolvePage() {
     const profilePorts = await this.profileCdpPorts();
     const processEndpoints = await this.processCdpEndpoints();
-    const harnessEndpoints = new Set([
+    const endpoints = [...new Set([
       ...profilePorts.map((port) => `http://127.0.0.1:${port}`),
-      ...String(this.explicitEndpoint).split(",").map(cdpHttpUrl).filter(Boolean),
+      ...cdpCandidates(this.explicitEndpoint, ""),
       ...processEndpoints,
-    ]);
-    const endpoints = new Set([...harnessEndpoints, ...cdpCandidates("", this.cdpPorts)]);
-    let reachable = false;
-    let httpStatus;
-    let refused = false;
-    let inaccessible = false;
-    let invalidResponse = false;
-    let unrelatedEndpoint = false;
+      ...cdpCandidates("", this.cdpPorts),
+    ])];
     for (const endpoint of endpoints) {
       try {
         if (endpoint.startsWith("ws")) return { webSocketDebuggerUrl: endpoint, source: "环境变量" };
         const response = await this.fetch(`${endpoint}/json/list`, { signal: AbortSignal.timeout(1200) });
-        if (!response.ok) { httpStatus = response.status; continue; }
+        if (!response.ok) continue;
         const targets = await response.json();
-        if (!Array.isArray(targets)) {
-          invalidResponse = true;
-          continue;
-        }
-        const associated = harnessEndpoints.has(endpoint);
-        const page = targets.find(item => item?.type === "page" && item.webSocketDebuggerUrl &&
-          (/^dsh-app:\/\/app(?:[/?#]|$)/i.test(item.url || "") ||
-            (associated && /^(?:DeepSeek )?Harness$/i.test(firstText(item.title)))));
-        if (page) return { webSocketDebuggerUrl: page.webSocketDebuggerUrl, source: endpoint, transportVerified: true };
-        reachable ||= associated;
-        unrelatedEndpoint ||= !associated;
-      } catch (error) {
-        if (error instanceof SyntaxError) invalidResponse = true;
-        else if (error?.cause?.code === "ECONNREFUSED") refused = true;
-        else inaccessible = true;
+        const page = Array.isArray(targets) && targets.find((item) => item && item.type === "page" && item.webSocketDebuggerUrl
+          && /deepseek|harness|dsh/i.test(`${item.title || ""} ${item.url || ""}`));
+        if (page) return { webSocketDebuggerUrl: page.webSocketDebuggerUrl, source: endpoint };
+      } catch {
+        // 未开启该端口是正常情况，继续探测下一个端点。
       }
     }
-    if (reachable) throw new DesktopProbeError("page", "CDP 已返回目标列表，但其中没有 DeepSeek Harness 控制页面。");
-    const details = [
-      httpStatus ? `目标列表请求返回 HTTP ${httpStatus}` : "",
-      invalidResponse ? "目标列表响应无效" : "",
-      unrelatedEndpoint ? "候选端口中未识别到 Harness CDP" : "",
-      refused ? "端口未开放（连接被拒绝）" : "",
-      inaccessible ? "端口不可访问或请求超时" : "",
-    ].filter(Boolean);
-    throw new DesktopProbeError("transport", `未发现 DeepSeek Harness 的 CDP 调试端点${details.length ? `（${details.join("、")}）` : ""}。`);
+    throw new Error("未发现 DeepSeek Harness 的 CDP 调试端点；请以 --remote-debugging-port 启动桌面应用，或设置 DSH_CDP_URL/DSH_CDP_PORTS。已在运行但未带调试端口的应用需要重启。");
   }
 
   async profileCdpPorts() {
@@ -257,8 +398,7 @@ class DshDesktopController {
     try {
       // Chromium 以首行保存动态 CDP 端口；该文件随 --user-data-dir 跨平台生成。
       const content = await this.readFile(require("path").join(userDataDir, "DevToolsActivePort"), "utf8");
-      const port = Number(String(content).split(/\r?\n/, 1)[0]);
-      return Number.isInteger(port) && port > 0 && port <= 65535 ? [port] : [];
+      return configuredCdpPorts(String(content).split(/\r?\n/, 1)[0]).slice(0, 1);
     } catch {
       return [];
     }
@@ -274,8 +414,7 @@ class DshDesktopController {
     if (now - this.processEndpointCache.at < PROCESS_ENDPOINT_TTL_MS) return this.processEndpointCache.endpoints;
     let endpoints = [];
     try {
-      const mains = dshDesktopMainProcesses(await this.listProcesses())
-        .filter(proc => !Object.hasOwn(proc, "executablePath") || desktopExecutable(proc, this.platform));
+      const mains = dshDesktopMainProcesses(await this.listProcesses());
       if (mains.length === 1) {
         const ports = new Set();
         const port = commandRemoteDebuggingPort(mains[0].command);
@@ -285,7 +424,7 @@ class DshDesktopController {
           try {
             const content = await this.readFile(require("path").join(userDataDir, "DevToolsActivePort"), "utf8");
             const filePort = Number(String(content).split(/\r?\n/, 1)[0]);
-            if (Number.isInteger(filePort) && filePort > 0 && filePort <= 65535) ports.add(filePort);
+            if (Number.isInteger(filePort) && filePort > 0) ports.add(filePort);
           } catch {
             // 未生成端口文件时只使用命令行中的显式端口。
           }
@@ -304,26 +443,13 @@ class DshDesktopController {
     const pageInfo = await this.resolvePage();
     const page = new CdpPageClient();
     let timer;
-    let connected = false;
-    let expired = false;
-    const connectionPhase = pageInfo.transportVerified ? "page" : "transport";
     try {
       const operation = (async () => {
-        try { await page.connectToPage(pageInfo.webSocketDebuggerUrl); }
-        catch {
-          throw new DesktopProbeError(connectionPhase, "无法建立 CDP 页面 WebSocket 连接。");
-        }
-        if (expired) return;
-        connected = true;
+        await page.connectToPage(pageInfo.webSocketDebuggerUrl);
         return callback(page, pageInfo);
       })();
       const timed = new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          expired = true;
-          reject(connected
-            ? new DesktopProbeError("page", "DeepSeek Harness CDP 页面操作超时，将在下一轮重新连接。")
-            : new DesktopProbeError(connectionPhase, "DeepSeek Harness CDP 页面 WebSocket 连接超时。"));
-        }, this.pageOperationTimeoutMs);
+        timer = setTimeout(() => reject(new Error("DeepSeek Harness CDP 页面操作超时，将在下一轮重新连接。")), this.pageOperationTimeoutMs);
       });
       return await Promise.race([operation, timed]);
     } finally {
@@ -334,24 +460,39 @@ class DshDesktopController {
     }
   }
 
+  async verifyCdpPage(pageInfo) {
+    const { CdpPageClient } = require("@rokid-prism/pluginbridge-plugin-sdk/cdp-runtime");
+    const page = new CdpPageClient();
+    let timer;
+    try {
+      await Promise.race([
+        page.connectToPage(pageInfo.webSocketDebuggerUrl),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("CDP WebSocket 连接超时")), 1500); }),
+      ]);
+      return true;
+    } finally {
+      if (timer) clearTimeout(timer);
+      void page.close().catch(() => undefined);
+    }
+  }
+
   async call(method, payload = {}) {
     // 每次调用均建立独立 CDP 页面连接。不能把前台 watcher 排在详情/历史读取后，
     // 否则某一次页面请求停滞会让实时快照永久只读。
     return this.callNow(method, payload);
   }
 
-  async callNow(method, payload = {}, probe = false) {
+  async callNow(method, payload = {}) {
     const name = firstText(method);
     if (!/^[a-z][a-z0-9]*(?:\.[a-z][A-Za-z0-9]*)+$/.test(name)) {
       throw new Error("DeepSeek Harness RPC 方法名无效。");
     }
-    if (this.rpcFlavor && !probe) return this.callWithFlavor(name, payload, this.rpcFlavor);
+    if (this.rpcFlavor) return this.callWithFlavor(name, payload, this.rpcFlavor);
     try {
       const value = await this.callWithFlavor(name, payload, "modern");
       this.rpcFlavor = "modern";
       return value;
     } catch (modernError) {
-      if (probe && modernError instanceof DesktopProbeError) throw modernError;
       try {
         const value = await this.callWithFlavor(name, payload, "legacy");
         this.rpcFlavor = "legacy";
@@ -440,41 +581,8 @@ class DshDesktopController {
     return { args: { request: payload } };
   }
 
-  async diagnostics() {
-    let processes;
-    try { processes = await this.listProcesses(); }
-    catch {
-      return { State: "unavailable", Code: "desktop_process_check_failed", Summary: "无法检测 DeepSeek Harness 桌面进程", Actions: ["recheck"] };
-    }
-    const executables = processes.map(proc => desktopExecutable(proc, this.platform)).filter(Boolean);
-    const installedFiles = await Promise.all([...new Set([...this.appPaths, ...executables])].map(async file => {
-      if (!/^deepseek harness(?:\.exe)?$/i.test(path.win32.basename(file))) return false;
-      try {
-        const info = await this.stat(file);
-        return info.isFile() && (this.platform === "win32" || (info.mode & 0o111) !== 0);
-      } catch { return false; }
-    }));
-    const Facts = { installed: installedFiles.some(Boolean), running: executables.length > 0, transport: "cdp", transport_reachable: false };
-    const Actions = ["managed_relaunch", "recheck"];
-    if (!Facts.installed) return { State: "not_installed", Code: "app_not_installed", Summary: "未安装 DeepSeek Harness 桌面端", Actions: ["open_download", "locate_agent", "recheck"], Facts };
-    if (!Facts.running) return { State: "not_running", Code: "not_running", Summary: "DeepSeek Harness 已安装，尚未启动", Actions, Facts };
-    // 托管重启可能立即换端口，诊断时直接检查进程端点。
-    this.processEndpointCache.at = 0;
-    try { await this.probe(); }
-    catch (error) {
-      if (error instanceof DesktopProbeError && error.phase === "transport") {
-        return { State: "unavailable", Code: "control_channel_unreachable", Summary: "DeepSeek Harness 已运行，但 CDP 未连通", Detail: error.message, Actions, Facts };
-      }
-      Facts.transport_reachable = true;
-      return { State: "unavailable", Code: "cdp_page_unavailable", Summary: "DeepSeek Harness 控制页面不可用",
-        Detail: error instanceof DesktopProbeError ? error.message : "CDP 页面已发现，但会话列表 RPC 握手失败。", Actions, Facts };
-    }
-    Facts.transport_reachable = true;
-    return { State: "ready", Code: "ready", Summary: "DeepSeek Harness 已连接", Facts };
-  }
-
   async probe() {
-    await this.callNow("session.list", {}, true);
+    await this.call("session.list", {});
   }
 
   async probeApprovals() {
@@ -974,5 +1082,11 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function diagnoseDeepSeekHarness(context = {}) {
+  const controller = context instanceof DshDesktopController ? context : new DshDesktopController(context);
+  return controller.diagnose();
+}
+
 module.exports = { DshDesktopController, cdpCandidates, configuredCdpPorts, commandUserDataDir, commandRemoteDebuggingPort,
-  dshDesktopMainProcesses, nativeQuestionAnswer };
+  dshDesktopMainProcesses, dshDesktopProcesses, dshAppCandidates, dshExecutableCandidate, sanitizeDiagnosticText,
+  diagnosticResult, diagnoseDeepSeekHarness, nativeQuestionAnswer };

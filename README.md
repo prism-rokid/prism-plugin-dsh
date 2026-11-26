@@ -46,14 +46,15 @@ copying Harness cookies or tokens into the plugin.
 - `DSH_CDP_URL`: 一个 `/json/list` 地址或页面 WebSocket 地址；支持逗号分隔多个候选
 - `DSH_CDP_PORTS`: CDP 端口候选列表；默认探测 `9222`、`9223`、`9333`
 - `PRISM_DSH_USER_DATA_DIR`: Chromium/Electron 用户数据目录；插件会读取其中的 `DevToolsActivePort`
+- `PRISM_DSH_APP_PATH` / `PRISM_DSH_APP_EXECUTABLE`: 覆盖 DeepSeek Harness 桌面程序路径；只用于确认真实桌面端是否安装，不会把 CLI 或插件目录视为桌面端
 - `DSH_API_BASE_URL`: native 模式的 Harness API 地址，默认 `http://127.0.0.1:3080`
 - `DSH_API_TOKEN`: native 模式使用的 Harness 启动 URL token
 - `DSH_API_COOKIE`: native 模式使用的已认证 Cookie
 
 desktop 模式优先使用 Harness 页面内的 RPC 和页面授权上下文。插件不会把
 token、Cookie 或签名 URL 写入日志，也不会在没有 CDP 授权时伪造在线状态。
-CDP 端口探测使用 Node 的 loopback HTTP/CDP WebSocket，在 macOS 和 Windows
-上采用同一套逻辑，不依赖 `lsof`、PowerShell 或其他平台命令。
+CDP 端口探测使用 Node 的 loopback HTTP/CDP WebSocket；进程识别在 Windows
+使用系统 PowerShell 接口，在 macOS/Linux 使用 `ps`，不会依赖 macOS 专有命令。
 
 ## Control-path notes
 

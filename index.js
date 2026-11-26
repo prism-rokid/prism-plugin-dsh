@@ -10,7 +10,7 @@ const PluginAdapterError = pluginBridge.PluginAdapterError || class extends Erro
   constructor(code, message) { super(message); this.code = code; }
 };
 const { DshClient, firstText } = require("./dsh_client");
-const { DshDesktopController } = require("./dsh_cdp");
+const { DshDesktopController, diagnosticResult } = require("./dsh_cdp");
 const { dshEventSummary, reconnectingDshEvents, sleep } = require("./dsh_events");
 
 const PLUGIN_ID = "dsh";
@@ -111,7 +111,17 @@ function permissionControls(state) {
   return { currentPermission, permissionOptions: options };
 }
 
-function capability(available, reason = "", canApproval = false) {
+function readyDiagnostics(transport = MODE === "desktop" ? "cdp" : "http") {
+  return diagnosticResult("ready", "ready", "DeepSeek Harness 已连接", "DeepSeek Harness 控制通道已连接。", {
+    installed: true, running: true, transport, transport_reachable: true,
+  });
+}
+
+function capability(available, reason = "", canApproval = false, diagnostics = null) {
+  const currentDiagnostics = diagnostics || (available ? readyDiagnostics() : diagnosticResult(
+    "unavailable", "unavailable", "DeepSeek Harness 不可用", reason || "DeepSeek Harness 当前不可用。",
+    { installed: false, running: false, transport: MODE === "desktop" ? "cdp" : "http", transport_reachable: false }, ["recheck"], reason,
+  ));
   return {
     PluginID: PLUGIN_ID, Available: available,
     NativeVisibleInput: MODE === "desktop", NativeVisibleOutput: MODE === "desktop",
@@ -121,7 +131,8 @@ function capability(available, reason = "", canApproval = false) {
     CanWaitRun: true, CanReadStatus: true, CanControlSession: true,
     IntegrationMode: MODE === "desktop" ? "desktop-automation" : "protocol-native",
     VisibilitySurface: MODE === "desktop" ? "deepseek-harness-desktop" : "deepseek-harness-api",
-    UnavailableReason: reason,
+    UnavailableReason: currentDiagnostics.State === "ready" ? "" : firstText(reason, currentDiagnostics.Detail, currentDiagnostics.Summary),
+    Diagnostics: currentDiagnostics,
   };
 }
 
@@ -688,18 +699,26 @@ function createAdapter(options = {}) {
     id() { return PLUGIN_ID; },
     async probe() {
       try {
-        const diagnostics = desktopTransport && typeof desktop.diagnostics === "function" ? await desktop.diagnostics() : undefined;
-        if (diagnostics && diagnostics.State !== "ready") {
-          approvalProtocolAvailable = false;
-          return { ...capability(false, diagnostics.Detail || diagnostics.Summary), Diagnostics: diagnostics };
+        let diagnostics;
+        if (desktopTransport && typeof desktop.diagnose === "function") {
+          diagnostics = await desktop.diagnose();
+        } else {
+          if (desktopTransport) await desktop.probe();
+          else await client.probe();
+          diagnostics = readyDiagnostics(desktopTransport ? "cdp" : "http");
         }
-        if (desktopTransport && !diagnostics) await desktop.probe();
-        if (!desktopTransport) await client.probe();
+        const available = diagnostics.State === "ready";
         approvalProtocolAvailable = desktopTransport && typeof desktop.probeApprovals === "function"
-          ? await desktop.probeApprovals()
+          ? available && await desktop.probeApprovals()
           : false;
-        return { ...capability(true, "", approvalProtocolAvailable), ...(diagnostics ? { Diagnostics: diagnostics } : {}) };
-      } catch (error) { return capability(false, error instanceof Error ? error.message : String(error)); }
+        return capability(available, diagnostics.State === "ready" ? "" : diagnostics.Detail, approvalProtocolAvailable, diagnostics);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const diagnostics = diagnosticResult("unavailable", "diagnostic_failed", "DeepSeek Harness 状态探测失败", detail, {
+          installed: false, running: false, transport: desktopTransport ? "cdp" : "http", transport_reachable: false,
+        }, ["recheck"], error && error.stack);
+        return capability(false, detail, false, diagnostics);
+      }
     },
     async discover() {
       try {
