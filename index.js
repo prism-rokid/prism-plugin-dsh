@@ -688,12 +688,17 @@ function createAdapter(options = {}) {
     id() { return PLUGIN_ID; },
     async probe() {
       try {
-        if (desktopTransport) await desktop.probe();
-        else await client.probe();
+        const diagnostics = desktopTransport && typeof desktop.diagnostics === "function" ? await desktop.diagnostics() : undefined;
+        if (diagnostics && diagnostics.State !== "ready") {
+          approvalProtocolAvailable = false;
+          return { ...capability(false, diagnostics.Detail || diagnostics.Summary), Diagnostics: diagnostics };
+        }
+        if (desktopTransport && !diagnostics) await desktop.probe();
+        if (!desktopTransport) await client.probe();
         approvalProtocolAvailable = desktopTransport && typeof desktop.probeApprovals === "function"
           ? await desktop.probeApprovals()
           : false;
-        return capability(true, "", approvalProtocolAvailable);
+        return { ...capability(true, "", approvalProtocolAvailable), ...(diagnostics ? { Diagnostics: diagnostics } : {}) };
       } catch (error) { return capability(false, error instanceof Error ? error.message : String(error)); }
     },
     async discover() {

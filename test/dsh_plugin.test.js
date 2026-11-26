@@ -1041,3 +1041,102 @@ test("客户端会用启动 token 换取 Cookie 并复用认证", async () => {
   await client.probe();
   assert.equal(requests, 2);
 });
+
+test("桌面 Probe 区分仅 CLI、未安装、未启动、CDP 和 RPC 失败，并在托管重启后清除旧错误", async () => {
+  const app = "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness";
+  const cli = "/usr/local/bin/dsh";
+  let files = [];
+  let processes = [];
+  let targets;
+  let browserTargets;
+  let networkCode = "ECONNREFUSED";
+  let rpcReady = false;
+  const desktop = new DshDesktopController({
+    platform: "darwin", appPaths: [app, cli],
+    listProcesses: async () => processes,
+    stat: async file => ({ isFile: () => files.includes(file), mode: 0o755 }),
+    fetch: async url => {
+      if (browserTargets && url === "http://127.0.0.1:9222/json/list") return { ok: true, json: async () => browserTargets };
+      if (targets && url === "http://127.0.0.1:61112/json/list") return { ok: true, json: async () => targets };
+      throw new Error("本地连接失败", { cause: { code: networkCode } });
+    },
+  });
+  desktop.withPage = async callback => {
+    await desktop.resolvePage();
+    return callback({ evaluate: async () => {
+      if (!rpcReady) throw new Error("不应出现在诊断中的远端信息");
+      return { items: [] };
+    } });
+  };
+  desktop.probeApprovals = async () => false;
+  const adapter = createAdapter({ desktop });
+  const probe = async (code, installed, running, reachable) => {
+    const result = await adapter.probe();
+    assert.equal(result.Available, code === "ready");
+    assert.equal(result.Diagnostics.Code, code);
+    assert.deepEqual(result.Diagnostics.Facts, { installed, running, transport: "cdp", transport_reachable: reachable });
+    return result;
+  };
+  await probe("app_not_installed", false, false, false);
+  files = [cli];
+  processes = [{ executablePath: cli, command: cli }];
+  await probe("app_not_installed", false, false, false);
+
+  files.push(app);
+  processes = [{ executablePath: app, command: `${app} --type=renderer` }];
+  await probe("not_running", true, false, false);
+  processes = [{ executablePath: app, command: app }];
+  assert.match((await probe("control_channel_unreachable", true, true, false)).Diagnostics.Detail, /端口未开放/);
+  networkCode = "EACCES";
+  assert.match((await probe("control_channel_unreachable", true, true, false)).Diagnostics.Detail, /不可访问/);
+
+  browserTargets = [{ type: "page", title: "DeepSeek Harness 文档", url: "https://example.test/harness", webSocketDebuggerUrl: "ws://localhost/browser" }];
+  assert.match((await probe("control_channel_unreachable", true, true, false)).Diagnostics.Detail, /未识别到 Harness CDP/);
+
+  processes = [{ executablePath: app, command: `${app} --remote-debugging-port=61112` }];
+  targets = [];
+  assert.match((await probe("cdp_page_unavailable", true, true, true)).Diagnostics.Detail, /没有.*控制页面/);
+  targets = [{ type: "page", title: "DeepSeek Harness", webSocketDebuggerUrl: "ws://localhost/page" }];
+  const rejected = await probe("cdp_page_unavailable", true, true, true);
+  assert.match(rejected.Diagnostics.Detail, /RPC 握手失败/);
+  assert.doesNotMatch(JSON.stringify(rejected), /远端信息/);
+  rpcReady = true;
+  const ready = await probe("ready", true, true, true);
+  assert.equal(ready.UnavailableReason, "");
+  assert.equal(ready.Diagnostics.Detail, undefined);
+  assert.equal(ready.Diagnostics.Stack, undefined);
+});
+
+test("显式 WebSocket 连接超时归为传输不可达，超时后不会执行 RPC", async () => {
+  const app = "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness";
+  const desktop = new DshDesktopController({
+    platform: "darwin",
+    endpoint: "ws://harness.test/page",
+    appPaths: [app],
+    listProcesses: async () => [{ executablePath: app, command: app }],
+    stat: async () => ({ isFile: () => true, mode: 0o755 }),
+    pageOperationTimeoutMs: 10,
+  });
+  const sdk = require("@rokid-prism/pluginbridge-plugin-sdk/cdp-runtime");
+  const original = sdk.CdpPageClient;
+  let finishConnect;
+  let evaluates = 0;
+  let closed = false;
+  sdk.CdpPageClient = class {
+    connectToPage() { return new Promise(resolve => { finishConnect = resolve; }); }
+    async evaluate() { evaluates++; }
+    async close() { closed = true; }
+  };
+  try {
+    const result = await desktop.diagnostics();
+    assert.equal(result.Code, "control_channel_unreachable");
+    assert.equal(result.Facts.transport_reachable, false);
+    assert.match(result.Detail, /WebSocket 连接超时/);
+    assert.equal(closed, true);
+    finishConnect();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(evaluates, 0);
+  } finally {
+    sdk.CdpPageClient = original;
+  }
+});
