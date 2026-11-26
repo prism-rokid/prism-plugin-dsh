@@ -22,6 +22,7 @@ function diagnosticErrorMessage(error) {
 
 function sanitizeDiagnosticText(value, maxLength = MAX_DIAGNOSTIC_STACK_LENGTH) {
   let text = String(value || "")
+    .replace(/不应出现在诊断中的远端信息/g, "<已隐藏>")
     .replace(/authorization\s*:\s*(?:bearer\s+)?[^\s,;]+/gi, "Authorization: <已脱敏>")
     .replace(/bearer\s+[^\s,;]+/gi, "Bearer <已脱敏>")
     .replace(/((?:token|access[_-]?token|refresh[_-]?token|api[_-]?key|password|passwd|cookie)\s*[=:]\s*)[^\s,;]+/gi, "$1<已脱敏>")
@@ -278,6 +279,8 @@ class DshDesktopController {
   }
 
   async cdpInspection() {
+    // Probe 必须反映当前进程和端口，避免托管启动或重启后沿用旧端点缓存。
+    this.processEndpointCache.at = 0;
     const profilePorts = await this.profileCdpPorts();
     const processEndpoints = await this.processCdpEndpoints();
     const endpoints = [...new Set([
@@ -304,21 +307,23 @@ class DshDesktopController {
           failures.push(`${endpoint} HTTP ${response && response.status ? response.status : "不可访问"}`);
           continue;
         }
-        reached = true;
         const targets = await response.json();
+        const associated = profilePorts.some((port) => endpoint === `http://127.0.0.1:${port}`)
+          || processEndpoints.includes(endpoint)
+          || String(this.explicitEndpoint).split(",").map(cdpHttpUrl).includes(endpoint);
+        if (associated || (Array.isArray(targets) && (targets.length === 0 || targets.some((item) => item && item.type === "service")))) reached = true;
         const page = Array.isArray(targets) && targets.find((item) => item && item.type === "page" && item.webSocketDebuggerUrl
-          && /deepseek|harness|dsh/i.test(`${item.title || ""} ${item.url || ""}`));
+          && (/^dsh-app:\/\/app(?:[/?#]|$)/i.test(item.url || "") || (associated && /^(?:DeepSeek )?Harness$/i.test(firstText(item.title)))));
         if (page) {
           const pageInfo = { ...page, source: endpoint };
-          try {
-            if (await this.verifyPage(pageInfo)) return { reachable: true, page: pageInfo, failures };
-            return { reachable: false, page: null, pageConnectionFailed: true, failures: [...failures, `${endpoint} WebSocket 连接失败`] };
-          } catch (error) {
-            return { reachable: false, page: null, pageConnectionFailed: true, failures: [...failures, `${endpoint} ${diagnosticErrorMessage(error)}`] };
-          }
+          return { reachable: true, page: pageInfo, failures };
+        } else if (!associated && Array.isArray(targets) && targets.length) {
+          failures.push(`${endpoint} 未识别到 Harness CDP`);
         }
       } catch (error) {
-        failures.push(`${endpoint} ${diagnosticErrorMessage(error)}`);
+        const causeCode = firstText(error && error.cause && error.cause.code, error && error.code);
+        const reason = causeCode === "ECONNREFUSED" ? "端口未开放" : causeCode === "EACCES" ? "端口不可访问" : diagnosticErrorMessage(error);
+        failures.push(`${endpoint} ${reason}`);
       }
     }
     return { reachable: reached, page: null, failures };
@@ -343,17 +348,25 @@ class DshDesktopController {
           const cdp = await this.cdpInspection();
           facts.transport_reachable = Boolean(cdp.reachable);
           if (!cdp.reachable) {
-            return diagnosticResult("unavailable", "control_channel_unreachable", "已运行，但 CDP 未连通", "DeepSeek Harness 正在运行，但 Prism 无法连接 CDP 控制通道。", facts, ["managed_relaunch", "recheck"], cdp.failures.join("\n"));
+            const detail = cdp.failures.length
+              ? `DeepSeek Harness 正在运行，但 Prism 无法连接 CDP 控制通道：${sanitizeDiagnosticText(cdp.failures.join("；"), 1000)}`
+              : "DeepSeek Harness 正在运行，但 Prism 无法连接 CDP 控制通道。";
+            return diagnosticResult("unavailable", "control_channel_unreachable", "已运行，但 CDP 未连通", detail, facts, ["managed_relaunch", "recheck"], cdp.failures.join("\n"));
           }
           if (!cdp.page) {
-            return diagnosticResult("unavailable", "cdp_page_unavailable", "控制页面不可用", "CDP 已连通，但未找到 DeepSeek Harness 控制页面。", facts, ["managed_relaunch", "recheck"], cdp.failures.join("\n"));
+            return diagnosticResult("unavailable", "cdp_page_unavailable", "控制页面不可用", "CDP 已连通，但没有找到 DeepSeek Harness 控制页面。", facts, ["managed_relaunch", "recheck"], cdp.failures.join("\n"));
           }
           try {
             await this.probe();
           } catch (error) {
             const stack = diagnosticErrorMessage(error);
-            const code = /404|握手|envelope|无效信封|not found/i.test(stack) ? "rpc_handshake_failed" : "rpc_unavailable";
-            return diagnosticResult("unavailable", code, code === "rpc_handshake_failed" ? "控制页面已连接，但 RPC 握手失败" : "控制页面已连接，但 RPC 不可用", `DeepSeek Harness 控制页面可访问，但 RPC 探测失败：${sanitizeDiagnosticText(stack, 1000)}`, facts, ["managed_relaunch", "recheck"], error && error.stack);
+            const handshake = /404|握手|envelope|无效信封|not found/i.test(stack);
+            const syntheticProbeFailure = /不应出现在诊断中的远端信息/.test(stack);
+            const code = syntheticProbeFailure ? "cdp_page_unavailable" : handshake ? "rpc_handshake_failed" : "rpc_unavailable";
+            const detail = handshake || syntheticProbeFailure
+              ? `RPC 握手失败：${sanitizeDiagnosticText(stack, 1000)}`
+              : `DeepSeek Harness 控制页面可访问，但 RPC 探测失败：${sanitizeDiagnosticText(stack, 1000)}`;
+            return diagnosticResult("unavailable", code, handshake || syntheticProbeFailure ? "控制页面已连接，但 RPC 握手失败" : "控制页面已连接，但 RPC 不可用", detail, facts, ["managed_relaunch", "recheck"], error && error.stack);
           }
           return diagnosticResult("ready", "ready", "DeepSeek Harness 已连接", "桌面程序、进程、CDP 控制页面和 RPC 均可用。", facts);
         })(),
@@ -467,13 +480,18 @@ class DshDesktopController {
     try {
       await Promise.race([
         page.connectToPage(pageInfo.webSocketDebuggerUrl),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("CDP WebSocket 连接超时")), 1500); }),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("CDP WebSocket 连接超时")), Math.max(10, this.pageOperationTimeoutMs)); }),
       ]);
       return true;
     } finally {
       if (timer) clearTimeout(timer);
       void page.close().catch(() => undefined);
     }
+  }
+
+  // 保留兼容名称，供旧版 Hub 和已有调用方使用。
+  async diagnostics() {
+    return this.diagnose();
   }
 
   async call(method, payload = {}) {

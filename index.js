@@ -122,6 +122,9 @@ function capability(available, reason = "", canApproval = false, diagnostics = n
     "unavailable", "unavailable", "DeepSeek Harness 不可用", reason || "DeepSeek Harness 当前不可用。",
     { installed: false, running: false, transport: MODE === "desktop" ? "cdp" : "http", transport_reachable: false }, ["recheck"], reason,
   ));
+  const wireDiagnostics = currentDiagnostics.State === "ready"
+    ? Object.fromEntries(Object.entries(currentDiagnostics).filter(([key]) => key !== "Detail" && key !== "Stack"))
+    : currentDiagnostics;
   return {
     PluginID: PLUGIN_ID, Available: available,
     NativeVisibleInput: MODE === "desktop", NativeVisibleOutput: MODE === "desktop",
@@ -132,7 +135,7 @@ function capability(available, reason = "", canApproval = false, diagnostics = n
     IntegrationMode: MODE === "desktop" ? "desktop-automation" : "protocol-native",
     VisibilitySurface: MODE === "desktop" ? "deepseek-harness-desktop" : "deepseek-harness-api",
     UnavailableReason: currentDiagnostics.State === "ready" ? "" : firstText(reason, currentDiagnostics.Detail, currentDiagnostics.Summary),
-    Diagnostics: currentDiagnostics,
+    Diagnostics: wireDiagnostics,
   };
 }
 
